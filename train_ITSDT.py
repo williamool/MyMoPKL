@@ -32,7 +32,7 @@ if __name__ == "__main__":
     mosaic              = False # mosaic数据增强
     mosaic_prob         = 0.5
     mixup               = False # mixup数据增强
-    mixup_prob          = 0.5
+    mixup_prob          = 0.5 # mixup概率
     special_aug_ratio   = 0.7 # 特殊数据增强比例
     Init_Epoch          = 0 # 初始训练轮数
     Freeze_Epoch        = 0 # 冻结训练轮数
