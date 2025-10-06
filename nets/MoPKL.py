@@ -3,11 +3,102 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .darknet import BaseConv, CSPDarknet, CSPLayer, DWConv
+from .darknet import BaseConv, CSPDarknet, CSPLayer, DWConv, Bottleneck
 from einops import rearrange
 import matplotlib.pyplot as plt
 import cv2
 import cupy as cp
+
+class TargetTextEncoder(nn.Module):
+    def __init__(self, num_classes=1, learnable_tokens=7, embed_dim=512):
+        super().__init__()
+        # 可学习上下文向量 [num_classes, 7, 512]
+        self.learnable_ctx = nn.Parameter(
+            torch.randn(num_classes, learnable_tokens, embed_dim) * 0.02
+        )
+        self.clip_model = None
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        
+        self._register_ema_compatible_params() # 将可学习上下文注册为模型参数 使其参与训练
+    
+    def _register_ema_compatible_params(self):
+        # 确保参数能被EMA正确捕获
+        if self.learnable_ctx is not None:
+            self.register_parameter('learnable_ctx', self.learnable_ctx)
+    
+    def encode_target_classes(self, class_names):
+        # 加载CLIP模型
+        try:
+            import clip
+        except ImportError:
+            raise ImportError("Please install CLIP: pip install git+https://github.com/ultralytics/CLIP.git")
+        
+        if self.clip_model is None:
+            self.clip_model = clip.load("ViT-B/32")[0]
+        
+        model = self.clip_model
+        device = next(model.parameters()).device
+        dtype = model.dtype
+        
+        text_token = torch.cat([clip.tokenize(p) for p in class_names]).to(device) # 文本转token
+        tokenized_prompts = model.token_embedding(text_token)[:, :70, :].type(dtype) # Token映射到高维空间
+        
+        learnable_ctx = self.learnable_ctx.to(device).to(dtype).detach().clone() # 拼接可学习上下文
+        x = torch.cat([tokenized_prompts, learnable_ctx], dim=1)
+        
+        x = x + model.positional_embedding.type(dtype) # 加上位置编码
+        
+        # 输入clip Transformer编码
+        x = x.permute(1, 0, 2)  # [77, 1, 512]
+        x = model.transformer(x)  # Transformer编码
+        x = x.permute(1, 0, 2)  # [1, 77, 512]
+        
+        x = model.ln_final(x).type(dtype)
+        txt_feats = x[torch.arange(x.shape[0]), text_token.argmax(dim=-1)] @ model.text_projection # 提取EOS token特征
+        
+        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True) # 归一化
+        final_embeddings = txt_feats.reshape(-1, len(class_names), txt_feats.shape[-1])
+        
+        return final_embeddings # [1, 1, 512]
+
+class ScoreCompute(nn.Module):
+
+    def __init__(self, c1, c2, num_heads=1, embed_dim=128, guide_dim=512, scale=False): # 输入/输出通道数 注意力头数 嵌入通道数 文本嵌入通道数 可学习放缩参数
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = c2 // num_heads # 注意力头以及每个注意力头通道数
+        self.img_conv = BaseConv(c1, embed_dim, k=1, act=False) if c1 != embed_dim else None # 映射图像特征到指定维度
+        self.text_linear = nn.Linear(guide_dim, embed_dim) # 映射文本特征到指定维度
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+        self.proj_conv = BaseConv(c1, c2, k=3, s=1, act=False) # 将输入特征投影到输出维度
+        self.scale = nn.Parameter(torch.ones(1, num_heads, 1, 1)) if scale else 1.0
+
+    def forward(self, img_feat, text_feat):
+        """Forward process."""
+        bs, _, h, w = img_feat.shape
+
+        # 映射文本特征到指定维度 多头格式
+        text_feat = self.text_linear(text_feat)
+        text_feat = text_feat.view(bs, -1, self.num_heads, self.head_dim)
+        # 映射图像特征到指定维度 多头格式
+        img_embed = self.img_conv(img_feat) if self.img_conv is not None else img_feat
+        img_embed = img_embed.view(bs, self.num_heads, self.head_dim, h, w)
+
+        # 计算每个像素图像与文本相似度
+        attn_weight = torch.einsum("bmchw,bnmc->bmhwn", img_embed, text_feat)
+        attn_weight = attn_weight.max(dim=-1)[0] # 每个像素取最大注意力得分 单类情况即单类得分
+        attn_weight = attn_weight / (self.head_dim**0.5) # 归一化
+        attn_weight = attn_weight + self.bias[None, :, None, None] # 添加偏置
+        attn_weight = attn_weight.sigmoid() * self.scale # 添加激活
+        score_map = attn_weight.mean(dim=1,keepdim=True) # 对所有注意力头取平均
+        
+        # 映射输入特征到输出维度
+        img_feat = self.proj_conv(img_feat)
+        img_feat = img_feat.view(bs, self.num_heads, -1, h, w)
+        img_feat = img_feat * attn_weight.unsqueeze(2)
+
+        return img_feat.view(bs, -1, h, w), score_map.squeeze(1) # 返回增强特征与得分图
 
 class MotionModel(nn.Module):
     # 初始化，超参数分别控制输入维度、潜在空间大小和隐藏层
@@ -110,57 +201,57 @@ class MotionModel(nn.Module):
         return motion
 
 
-class GraphAttentionLayer(nn.Module):
-    # 单头GAT
-    def __init__(self, in_dim, out_dim, alpha=0.2):
-        super(GraphAttentionLayer, self).__init__()
-        self.W = nn.Linear(in_dim, out_dim, bias=False) # 把节点输入维度映射到输出维度
-        self.a = nn.Parameter(torch.zeros(size=(2*out_dim, 1))) # 注意力参数向量
-        nn.init.xavier_uniform_(self.a.data, gain=1.414) # xacier初始化
-        self.leaky_relu = nn.LeakyReLU(alpha)
-        
-    def forward(self, h, adj):
-        B, N, _ = h.size()
-        Wh = self.W(h) # 对所有节点特征做线性变换
-        Wh_i = Wh.unsqueeze(2).expand(-1, -1, N, -1) 
-        Wh_j = Wh.unsqueeze(1).expand(-1, N, -1, -1) # 复制节点ij的特征
-        Wh_cat = torch.cat([Wh_i, Wh_j], dim=-1) # 拼接特征，得到(B, N, N, 2*out_dim)，表示每一对节点ij的特征对
-        e = torch.matmul(Wh_cat, self.a).squeeze(-1)    
-        e = self.leaky_relu(e) # 用参数向量a对特征对做投影，得到注意力分数
-        zero_vec = -9e15*torch.ones_like(e)
-        attention = torch.where(adj > 0, e, zero_vec) # 只保留邻接矩阵里存在的边的分数，确保softmax时只在相连节点归一化
-        attention = F.softmax(attention, dim=-1) # 对每个节点i，归一化所有邻居j的注意力系数
-        h_prime = torch.matmul(attention, Wh) # 聚合邻居特征，更新节点表示
-        
-        return F.elu(h_prime)
+# class GraphAttentionLayer(nn.Module):
+#     # 单头GAT
+#     def __init__(self, in_dim, out_dim, alpha=0.2):
+#         super(GraphAttentionLayer, self).__init__()
+#         self.W = nn.Linear(in_dim, out_dim, bias=False) # 把节点输入维度映射到输出维度
+#         self.a = nn.Parameter(torch.zeros(size=(2*out_dim, 1))) # 注意力参数向量
+#         nn.init.xavier_uniform_(self.a.data, gain=1.414) # xacier初始化
+#         self.leaky_relu = nn.LeakyReLU(alpha)
+#         
+#     def forward(self, h, adj):
+#         B, N, _ = h.size()
+#         Wh = self.W(h) # 对所有节点特征做线性变换
+#         Wh_i = Wh.unsqueeze(2).expand(-1, -1, N, -1) 
+#         Wh_j = Wh.unsqueeze(1).expand(-1, N, -1, -1) # 复制节点ij的特征
+#         Wh_cat = torch.cat([Wh_i, Wh_j], dim=-1) # 拼接特征，得到(B, N, N, 2*out_dim)，表示每一对节点ij的特征对
+#         e = torch.matmul(Wh_cat, self.a).squeeze(-1)    
+#         e = self.leaky_relu(e) # 用参数向量a对特征对做投影，得到注意力分数
+#         zero_vec = -9e15*torch.ones_like(e)
+#         attention = torch.where(adj > 0, e, zero_vec) # 只保留邻接矩阵里存在的边的分数，确保softmax时只在相连节点归一化
+#         attention = F.softmax(attention, dim=-1) # 对每个节点i，归一化所有邻居j的注意力系数
+#         h_prime = torch.matmul(attention, Wh) # 聚合邻居特征，更新节点表示
+#         
+#         return F.elu(h_prime)
 
 
-class MultiHeadGATLayer(nn.Module):
-    # 多头GAT
-    def __init__(self, in_dim, out_dim, num_heads=4, alpha=0.2): # 4个注意力头，每个都有独立的权重矩阵和注意力向量
-        super(MultiHeadGATLayer, self).__init__()
-        self.heads = nn.ModuleList([
-            GraphAttentionLayer(in_dim, out_dim, alpha=alpha) 
-            for _ in range(num_heads)
-        ])
-        
-    def forward(self, h, adj):
-        out = [head(h, adj) for head in self.heads] # 对每个注意力头执行一次前向传播
-        out = torch.cat(out, dim=-1) # 多头注意力特征拼接
-        return out
+# class MultiHeadGATLayer(nn.Module):
+#     # 多头GAT
+#     def __init__(self, in_dim, out_dim, num_heads=4, alpha=0.2): # 4个注意力头，每个都有独立的权重矩阵和注意力向量
+#         super(MultiHeadGATLayer, self).__init__()
+#         self.heads = nn.ModuleList([
+#             GraphAttentionLayer(in_dim, out_dim, alpha=alpha) 
+#             for _ in range(num_heads)
+#         ])
+#         
+#     def forward(self, h, adj):
+#         out = [head(h, adj) for head in self.heads] # 对每个注意力头执行一次前向传播
+#         out = torch.cat(out, dim=-1) # 多头注意力特征拼接
+#         return out
 
-class GATNet(nn.Module):
-    # 叠加两个多头注意力层
-    def __init__(self, in_dim=1024, hidden_dim=128, out_dim=256, 
-                 num_heads_1=8, num_heads_2=8, alpha=0.2):
-        super(GATNet, self).__init__()
-        self.gat1 = MultiHeadGATLayer(in_dim, hidden_dim, num_heads=num_heads_1, alpha=alpha)
-        self.gat2 = MultiHeadGATLayer(hidden_dim * num_heads_1, out_dim, num_heads=num_heads_2, alpha=alpha)
-        
-    def forward(self, x, adj):
-        x = self.gat1(x, adj)  
-        x = self.gat2(x, adj)  
-        return x
+# class GATNet(nn.Module):
+#     # 叠加两个多头注意力层
+#     def __init__(self, in_dim=1024, hidden_dim=128, out_dim=256, 
+#                  num_heads_1=8, num_heads_2=8, alpha=0.2):
+#         super(GATNet, self).__init__()
+#         self.gat1 = MultiHeadGATLayer(in_dim, hidden_dim, num_heads=num_heads_1, alpha=alpha)
+#         self.gat2 = MultiHeadGATLayer(hidden_dim * num_heads_1, out_dim, num_heads=num_heads_2, alpha=alpha)
+#         
+#     def forward(self, x, adj):
+#         x = self.gat1(x, adj)  
+#         x = self.gat2(x, adj)  
+#         return x
 
  
 
@@ -216,7 +307,7 @@ class MoPKL(nn.Module):
         self.conv_vl = nn.Sequential(
             BaseConv(128*2,256,3,1),
             BaseConv(256,256,3,1),
-            BaseConv(256,256,1,1))
+            BaseConv(256,512,1,1))  # 输出512通道，便于后续划分为两部分
         self.conv_m = nn.Sequential(
             BaseConv(1,64,3,2),
             BaseConv(64,128,3,2),
@@ -236,19 +327,35 @@ class MoPKL(nn.Module):
         self.motion = MotionModel(text_input_dim=130*300, latent_dim=128, hidden_dim=1024)
 
         
-        self.GAT = GATNet(
-                            in_dim=1024, 
-                            hidden_dim=128, 
-                            out_dim=512, 
-                            num_heads_1=2, 
-                            num_heads_2=2, 
-                            alpha=0.2
-                        )
+        # self.GAT = GATNet(
+        #                     in_dim=1024, 
+        #                     hidden_dim=128, 
+        #                     out_dim=512, 
+        #                     num_heads_1=2, 
+        #                     num_heads_2=2, 
+        #                     alpha=0.2
+        #                 )
         self.m1 = nn.Sequential(
             BaseConv(16,64,3,1),
             BaseConv(64,128,3,1),
             BaseConv(128,128,1,1))
         self.m2 = nn.Linear(1024,4096)
+        
+        # bottleneck模块处理后半特征
+        self.c = 256  # hidden channels
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut=True, g=1, k=((3, 3), (3, 3)), e=1.0) for _ in range(3))
+        
+        # 目标类别文本编码器
+        self.target_encoder = TargetTextEncoder(num_classes=1, learnable_tokens=7, embed_dim=512)
+        # 生成目标类别文本嵌入
+        target_classes = ['target']
+        self.txt_feats = self.target_encoder.encode_target_classes(target_classes)  # [1, 1, 512]
+        
+        # 图像-文本注意力模块
+        self.attn = ScoreCompute(self.c, self.c, guide_dim=512, embed_dim=128, num_heads=1)
+        
+        # 特征融合层
+        self.feat_fusion = BaseConv((3 + 3) * self.c, self.c, k=1, s=1, act=False)  # (3 + n) * self.c, c2
         
     def forward(self, inputs, descriptions=None, multi_targets=None, relation=None):
         feat = []
@@ -258,7 +365,24 @@ class MoPKL(nn.Module):
             f_feats = self.backbone(inputs[:,:,i,:,:]) # 提取特征，inputs参数分别为：Batch size, Channel, 第几帧, Height, Width
             feat.append(f_feats) # 把特征存到列表feat
         B, N, W, H = f_feats.shape
-        feats = self.conv_vl(torch.cat(feat,1)).squeeze(1) # 把相邻两帧在通道拼接后做卷积融合
+        feats_fused = self.conv_vl(torch.cat(feat,1)).squeeze(1) # 把相邻两帧在通道拼接后做卷积融合 [4, 512, 64, 64]
+        # 按通道划分为两部分
+        feats_part1, feats_part2 = torch.chunk(feats_fused, 2, dim=1)  # 将512通道分为两个256通道
+        # 对后半特征应用bottleneck
+        feat_list = [feats_part2]  # 初始化为包含feats_part2的列表
+        feat_list.extend(m(feat_list[-1]) for m in self.m)  # 使用extend方式应用bottleneck
+        
+        # 使用预生成的文本嵌入
+        text_feat = self.txt_feats  # [1, 1, 512]
+        
+        # 扩展文本特征以匹配批次大小
+        if len(text_feat) != len(feat_list[-1]):
+            text_feat = text_feat.expand(feat_list[-1].shape[0], -1, -1) # [batch_size, num_classes, 512]
+        
+        # 图像-文本注意力交互，生成得分图
+        attn_feat, score_map = self.attn(feat_list[-1], text_feat)  # 后一部分做图像-文本注意
+        feat_list.append(attn_feat)  # 新特征拼接
+        fused_feat = self.feat_fusion(torch.cat(feat_list, 1))  # 特征融合
 
         if self.training: 
             # Language-Driven Motion Alignment
@@ -269,22 +393,23 @@ class MoPKL(nn.Module):
                                                 brightness_factor=0.1, motion_threshold=1e-2) # 得到运动先验热力图
             motion_prior_cpu = [cp.asnumpy(h) if hasattr(h, 'ndim') else h for h in motion_prior]
             motion_prior = torch.tensor(np.stack(motion_prior_cpu)).cuda() # 转成torch sensor
-            motion, loss_alignment = self.motion.train_forward(motion_prior, feats, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
+            motion, loss_alignment = self.motion.train_forward(motion_prior, feats_part1, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
             # 输入参数分别代表：运动先验热力图（由实际框得到），最后两帧融合特征，最后一帧的语言描述
 
             # Motion-Relation Learning
-            v_feat = self.vf(feats) # 视觉特征转换
-            v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示，把每个空间位置当作一个图节点，每个节点n维特征
-            h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
-            h_i = h.unsqueeze(2) 
-            h_j = h.unsqueeze(1)
-            pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
-            loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
+            # v_feat = self.vf(feats) # 视觉特征转换
+            # v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示，把每个空间位置当作一个图节点，每个节点n维特征
+            # h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
+            # h_i = h.unsqueeze(2) 
+            # h_j = h.unsqueeze(1)
+            # pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
+            # loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
+            loss_relation = torch.tensor(0.0, device=feats_part1.device)  # 设置图卷积损失为0
         else:
-            motion = self.motion.inference_forward(feats)
+            motion = self.motion.inference_forward(feats_part1)
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
-        feat = self.fusion(motion, feat[-1]) # 
+        feat = self.fusion(motion, fused_feat) # 使用融合后的特征
         outputs  = self.head(feat) 
         
         if self.training:
