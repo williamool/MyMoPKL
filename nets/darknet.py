@@ -19,6 +19,8 @@ def get_activation(name="silu", inplace=True):
         module = nn.LeakyReLU(0.1, inplace=inplace)
     elif name == "sigmoid":
         module = nn.Sigmoid()
+    elif name == False or name is None:
+        module = nn.Identity()  # 无激活函数，直接返回输入
     else:
         raise AttributeError("Unsupported act type: {}".format(name))
     return module

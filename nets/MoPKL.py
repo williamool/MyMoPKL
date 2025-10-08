@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .darknet import BaseConv, CSPDarknet, CSPLayer, DWConv, Bottleneck
+from .graph_conv import GraphUpdate, update_features_with_gcn, ImagePoolingAttn
 from einops import rearrange
 import matplotlib.pyplot as plt
 import cv2
@@ -68,10 +69,10 @@ class ScoreCompute(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c2 // num_heads # 注意力头以及每个注意力头通道数
-        self.img_conv = BaseConv(c1, embed_dim, k=1, act=False) if c1 != embed_dim else None # 映射图像特征到指定维度
+        self.img_conv = BaseConv(c1, embed_dim, ksize=1, stride=1, act=False) if c1 != embed_dim else None # 映射图像特征到指定维度
         self.text_linear = nn.Linear(guide_dim, embed_dim) # 映射文本特征到指定维度
         self.bias = nn.Parameter(torch.zeros(num_heads))
-        self.proj_conv = BaseConv(c1, c2, k=3, s=1, act=False) # 将输入特征投影到输出维度
+        self.proj_conv = BaseConv(c1, c2, ksize=3, stride=1, act=False) # 将输入特征投影到输出维度
         self.scale = nn.Parameter(torch.ones(1, num_heads, 1, 1)) if scale else 1.0
 
     def forward(self, img_feat, text_feat):
@@ -201,57 +202,57 @@ class MotionModel(nn.Module):
         return motion
 
 
-# class GraphAttentionLayer(nn.Module):
-#     # 单头GAT
-#     def __init__(self, in_dim, out_dim, alpha=0.2):
-#         super(GraphAttentionLayer, self).__init__()
-#         self.W = nn.Linear(in_dim, out_dim, bias=False) # 把节点输入维度映射到输出维度
-#         self.a = nn.Parameter(torch.zeros(size=(2*out_dim, 1))) # 注意力参数向量
-#         nn.init.xavier_uniform_(self.a.data, gain=1.414) # xacier初始化
-#         self.leaky_relu = nn.LeakyReLU(alpha)
-#         
-#     def forward(self, h, adj):
-#         B, N, _ = h.size()
-#         Wh = self.W(h) # 对所有节点特征做线性变换
-#         Wh_i = Wh.unsqueeze(2).expand(-1, -1, N, -1) 
-#         Wh_j = Wh.unsqueeze(1).expand(-1, N, -1, -1) # 复制节点ij的特征
-#         Wh_cat = torch.cat([Wh_i, Wh_j], dim=-1) # 拼接特征，得到(B, N, N, 2*out_dim)，表示每一对节点ij的特征对
-#         e = torch.matmul(Wh_cat, self.a).squeeze(-1)    
-#         e = self.leaky_relu(e) # 用参数向量a对特征对做投影，得到注意力分数
-#         zero_vec = -9e15*torch.ones_like(e)
-#         attention = torch.where(adj > 0, e, zero_vec) # 只保留邻接矩阵里存在的边的分数，确保softmax时只在相连节点归一化
-#         attention = F.softmax(attention, dim=-1) # 对每个节点i，归一化所有邻居j的注意力系数
-#         h_prime = torch.matmul(attention, Wh) # 聚合邻居特征，更新节点表示
-#         
-#         return F.elu(h_prime)
+class GraphAttentionLayer(nn.Module):
+    # 单头GAT
+    def __init__(self, in_dim, out_dim, alpha=0.2):
+        super(GraphAttentionLayer, self).__init__()
+        self.W = nn.Linear(in_dim, out_dim, bias=False) # 把节点输入维度映射到输出维度
+        self.a = nn.Parameter(torch.zeros(size=(2*out_dim, 1))) # 注意力参数向量
+        nn.init.xavier_uniform_(self.a.data, gain=1.414) # xacier初始化
+        self.leaky_relu = nn.LeakyReLU(alpha)
+        
+    def forward(self, h, adj):
+        B, N, _ = h.size()
+        Wh = self.W(h) # 对所有节点特征做线性变换
+        Wh_i = Wh.unsqueeze(2).expand(-1, -1, N, -1) 
+        Wh_j = Wh.unsqueeze(1).expand(-1, N, -1, -1) # 复制节点ij的特征
+        Wh_cat = torch.cat([Wh_i, Wh_j], dim=-1) # 拼接特征，得到(B, N, N, 2*out_dim)，表示每一对节点ij的特征对
+        e = torch.matmul(Wh_cat, self.a).squeeze(-1)    
+        e = self.leaky_relu(e) # 用参数向量a对特征对做投影，得到注意力分数
+        zero_vec = -9e15*torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec) # 只保留邻接矩阵里存在的边的分数，确保softmax时只在相连节点归一化
+        attention = F.softmax(attention, dim=-1) # 对每个节点i，归一化所有邻居j的注意力系数
+        h_prime = torch.matmul(attention, Wh) # 聚合邻居特征，更新节点表示
+        
+        return F.elu(h_prime)
 
 
-# class MultiHeadGATLayer(nn.Module):
-#     # 多头GAT
-#     def __init__(self, in_dim, out_dim, num_heads=4, alpha=0.2): # 4个注意力头，每个都有独立的权重矩阵和注意力向量
-#         super(MultiHeadGATLayer, self).__init__()
-#         self.heads = nn.ModuleList([
-#             GraphAttentionLayer(in_dim, out_dim, alpha=alpha) 
-#             for _ in range(num_heads)
-#         ])
-#         
-#     def forward(self, h, adj):
-#         out = [head(h, adj) for head in self.heads] # 对每个注意力头执行一次前向传播
-#         out = torch.cat(out, dim=-1) # 多头注意力特征拼接
-#         return out
+class MultiHeadGATLayer(nn.Module):
+    # 多头GAT
+    def __init__(self, in_dim, out_dim, num_heads=4, alpha=0.2): # 4个注意力头，每个都有独立的权重矩阵和注意力向量
+        super(MultiHeadGATLayer, self).__init__()
+        self.heads = nn.ModuleList([
+            GraphAttentionLayer(in_dim, out_dim, alpha=alpha) 
+            for _ in range(num_heads)
+        ])
+        
+    def forward(self, h, adj):
+        out = [head(h, adj) for head in self.heads] # 对每个注意力头执行一次前向传播
+        out = torch.cat(out, dim=-1) # 多头注意力特征拼接
+        return out
 
-# class GATNet(nn.Module):
-#     # 叠加两个多头注意力层
-#     def __init__(self, in_dim=1024, hidden_dim=128, out_dim=256, 
-#                  num_heads_1=8, num_heads_2=8, alpha=0.2):
-#         super(GATNet, self).__init__()
-#         self.gat1 = MultiHeadGATLayer(in_dim, hidden_dim, num_heads=num_heads_1, alpha=alpha)
-#         self.gat2 = MultiHeadGATLayer(hidden_dim * num_heads_1, out_dim, num_heads=num_heads_2, alpha=alpha)
-#         
-#     def forward(self, x, adj):
-#         x = self.gat1(x, adj)  
-#         x = self.gat2(x, adj)  
-#         return x
+class GATNet(nn.Module):
+    # 叠加两个多头注意力层
+    def __init__(self, in_dim=1024, hidden_dim=128, out_dim=256, 
+                 num_heads_1=8, num_heads_2=8, alpha=0.2):
+        super(GATNet, self).__init__()
+        self.gat1 = MultiHeadGATLayer(in_dim, hidden_dim, num_heads=num_heads_1, alpha=alpha)
+        self.gat2 = MultiHeadGATLayer(hidden_dim * num_heads_1, out_dim, num_heads=num_heads_2, alpha=alpha)
+        
+    def forward(self, x, adj):
+        x = self.gat1(x, adj)  
+        x = self.gat2(x, adj)  
+        return x
 
  
 
@@ -327,14 +328,14 @@ class MoPKL(nn.Module):
         self.motion = MotionModel(text_input_dim=130*300, latent_dim=128, hidden_dim=1024)
 
         
-        # self.GAT = GATNet(
-        #                     in_dim=1024, 
-        #                     hidden_dim=128, 
-        #                     out_dim=512, 
-        #                     num_heads_1=2, 
-        #                     num_heads_2=2, 
-        #                     alpha=0.2
-        #                 )
+        self.GAT = GATNet(
+                            in_dim=1024,    # 输入节点特征维度
+                            hidden_dim=128, # 第一层每个头的输出维度
+                            out_dim=512,  # 第二层每个头的输出维度
+                            num_heads_1=2, # 第一层注意力头数
+                            num_heads_2=2, # 第二层注意力头数
+                            alpha=0.2     # LeakyReLU负斜率
+                        )
         self.m1 = nn.Sequential(
             BaseConv(16,64,3,1),
             BaseConv(64,128,3,1),
@@ -343,7 +344,7 @@ class MoPKL(nn.Module):
         
         # bottleneck模块处理后半特征
         self.c = 256  # hidden channels
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut=True, g=1, k=((3, 3), (3, 3)), e=1.0) for _ in range(3))
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut=True, expansion=0.5) for _ in range(1))
         
         # 目标类别文本编码器
         self.target_encoder = TargetTextEncoder(num_classes=1, learnable_tokens=7, embed_dim=512)
@@ -354,8 +355,22 @@ class MoPKL(nn.Module):
         # 图像-文本注意力模块
         self.attn = ScoreCompute(self.c, self.c, guide_dim=512, embed_dim=128, num_heads=1)
         
-        # 特征融合层
-        self.feat_fusion = BaseConv((3 + 3) * self.c, self.c, k=1, s=1, act=False)  # (3 + n) * self.c, c2
+        # 特征融合
+        self.feat_fusion = BaseConv((3 + 1) * self.c, self.c, k=1, s=1, act=False)  # (1个bottleneck + 1个part2原始 + 1个part1 + 1个注意力) * self.c
+
+        # 图卷积更新融合特征
+        self.graph_update = GraphUpdate(self.c, 64, self.c)
+        
+        # 图像池化注意力模块：用于通过图像特征更新文本嵌入
+        self.image_pooling_attn = ImagePoolingAttn(
+            ec=256,           # 嵌入通道数
+            ch=(256,),        # 单一尺度特征图通道数
+            ct=512,           # 文本嵌入通道数
+            nh=8,             # 注意力头数
+            k=3,              # 池化核大小
+            scale=False        # 使用可学习的缩放参数
+        )
+        
         
     def forward(self, inputs, descriptions=None, multi_targets=None, relation=None):
         feat = []
@@ -369,8 +384,8 @@ class MoPKL(nn.Module):
         # 按通道划分为两部分
         feats_part1, feats_part2 = torch.chunk(feats_fused, 2, dim=1)  # 将512通道分为两个256通道
         # 对后半特征应用bottleneck
-        feat_list = [feats_part2]  # 初始化为包含feats_part2的列表
-        feat_list.extend(m(feat_list[-1]) for m in self.m)  # 使用extend方式应用bottleneck
+        feat_list = [feats_part1, feats_part2]  # 初始化为包含feats_part1和feats_part2的列表
+        feat_list.extend(m(feat_list[-1]) for m in self.m)  # 使用extend方式应用bottleneck [4, 256 * 3, 64, 64]
         
         # 使用预生成的文本嵌入
         text_feat = self.txt_feats  # [1, 1, 512]
@@ -380,9 +395,16 @@ class MoPKL(nn.Module):
             text_feat = text_feat.expand(feat_list[-1].shape[0], -1, -1) # [batch_size, num_classes, 512]
         
         # 图像-文本注意力交互，生成得分图
-        attn_feat, score_map = self.attn(feat_list[-1], text_feat)  # 后一部分做图像-文本注意
+        attn_feat, score_map = self.attn(feat_list[-1], text_feat)  # 后一部分做图像-文本注意 [4, 256, 64, 64]
         feat_list.append(attn_feat)  # 新特征拼接
-        fused_feat = self.feat_fusion(torch.cat(feat_list, 1))  # 特征融合
+        fused_feat = self.feat_fusion(torch.cat(feat_list, 1))  # 特征融合 [4, 256, 64, 64]
+
+        fused_feat = update_features_with_gcn(fused_feat, score_map, self.graph_update, k_ratio=0.007, similarity_threshold=0.5)
+
+        # 使用单一尺度特征图更新文本嵌入
+        single_scale_feats = [fused_feat]
+        enhanced_text_feat = self.image_pooling_attn(single_scale_feats, text_feat)
+        text_feat = enhanced_text_feat
 
         if self.training: 
             # Language-Driven Motion Alignment
@@ -393,23 +415,22 @@ class MoPKL(nn.Module):
                                                 brightness_factor=0.1, motion_threshold=1e-2) # 得到运动先验热力图
             motion_prior_cpu = [cp.asnumpy(h) if hasattr(h, 'ndim') else h for h in motion_prior]
             motion_prior = torch.tensor(np.stack(motion_prior_cpu)).cuda() # 转成torch sensor
-            motion, loss_alignment = self.motion.train_forward(motion_prior, feats_part1, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
-            # 输入参数分别代表：运动先验热力图（由实际框得到），最后两帧融合特征，最后一帧的语言描述
+            motion, loss_alignment = self.motion.train_forward(motion_prior, fused_feat, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
+            # 输入参数分别代表：运动先验热力图（由实际框得到），增强特征，最后一帧的语言描述
 
             # Motion-Relation Learning
-            # v_feat = self.vf(feats) # 视觉特征转换
-            # v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示，把每个空间位置当作一个图节点，每个节点n维特征
-            # h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
-            # h_i = h.unsqueeze(2) 
-            # h_j = h.unsqueeze(1)
-            # pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
-            # loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
-            loss_relation = torch.tensor(0.0, device=feats_part1.device)  # 设置图卷积损失为0
-        else:
-            motion = self.motion.inference_forward(feats_part1)
+            v_feat = self.vf(fused_feat) # 视觉特征转换，从256通道降到16通道 [4, 16, 32, 32]
+            v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示 把每个空间位置当作一个图节点 每个节点n维特征
+            h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
+            h_i = h.unsqueeze(2) 
+            h_j = h.unsqueeze(1)
+            pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
+            loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
+        else:   
+            motion = self.motion.inference_forward(fused_feat)
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
-        feat = self.fusion(motion, fused_feat) # 使用融合后的特征
+        feat = self.fusion(motion, fused_feat)
         outputs  = self.head(feat) 
         
         if self.training:
