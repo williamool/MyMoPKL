@@ -21,6 +21,8 @@ from utils.utils_fit import fit_one_epoch
 
 if __name__ == "__main__":
     
+    torch.autograd.set_detect_anomaly(True)
+    
     Cuda            = True
     distributed     = False # 使用分布式训练
     sync_bn         = False # 使用同步批归一化

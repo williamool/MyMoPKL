@@ -406,23 +406,20 @@ class ModelEMA:
     """
 
     def __init__(self, model, decay=0.9999, tau=2000, updates=0):
-        # Create EMA - 处理深拷贝问题
-        try:
-            self.ema = deepcopy(de_parallel(model)).eval()  # FP32 EMA
-        except RuntimeError as e:
-            # 如果深拷贝失败（通常是由于CLIP模型中的特殊张量），使用备用方案
-            print(f"Warning: deepcopy failed ({e}), using alternative EMA initialization")
-            model_state = de_parallel(model).state_dict()
-            # 创建一个新的模型实例
-            original_model = de_parallel(model)
-            self.ema = type(original_model)(num_classes=original_model.num_classes, num_frame=original_model.num_frame)
-            self.ema.load_state_dict(model_state)
-            self.ema.eval()
-        
-        # if next(model.parameters()).device.type != 'cpu':
-        #     self.ema.half()  # FP16 EMA
-        self.updates = updates  # number of EMA updates
-        self.decay = lambda x: decay * (1 - math.exp(-x / tau))  # decay exponential ramp (to help early epochs)
+        original_model = de_parallel(model)
+
+        # 用 state_dict 拷贝参数
+        model_state = original_model.state_dict()
+        # 重新构造一个同类型的新模型
+        self.ema = type(original_model)(
+            num_classes=original_model.num_classes,
+            num_frame=original_model.num_frame
+        ).to(next(original_model.parameters()).device)
+        self.ema.load_state_dict(model_state)
+        self.ema.eval()
+
+        self.updates = updates
+        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
         for p in self.ema.parameters():
             p.requires_grad_(False)
 

@@ -85,7 +85,10 @@ def update_features_with_gcn(z, score, graph_update_module, k_ratio=0.001, simil
     # 将增强后的特征替换回原始特征图
     new_z = z.clone()
     updated_features = updated_features.to(new_z.dtype)
-    new_z.view(batch_size, channels, -1).scatter_(2, flat_indices.unsqueeze(1).expand(-1, channels, -1), updated_features)
+    # 使用非就地操作scatter，避免梯度计算问题
+    new_z_flat = new_z.view(batch_size, channels, -1)
+    new_z_flat = new_z_flat.scatter(2, flat_indices.unsqueeze(1).expand(-1, channels, -1), updated_features)
+    new_z = new_z_flat.view(batch_size, channels, height, width)
     
     return new_z
 
@@ -116,6 +119,12 @@ class ImagePoolingAttn(nn.Module):
     def forward(self, x, text):
         bs = x[0].shape[0]  # batch_size
         assert len(x) == self.nf  # 确保特征图数量与预期一致
+        
+        # 确保text的数据类型与模型权重一致
+        # 获取模型的目标数据类型（从第一个投影层获取）
+        target_dtype = next(self.projections[0].parameters()).dtype
+        if text.dtype != target_dtype:
+            text = text.to(target_dtype)
         
         num_patches = self.k**2  # 池化后patch数
         

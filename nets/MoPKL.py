@@ -68,7 +68,7 @@ class ScoreCompute(nn.Module):
     def __init__(self, c1, c2, num_heads=1, embed_dim=128, guide_dim=512, scale=False): # 输入/输出通道数 注意力头数 嵌入通道数 文本嵌入通道数 可学习放缩参数
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = c2 // num_heads # 注意力头以及每个注意力头通道数
+        self.head_dim = embed_dim // num_heads # 注意力头以及每个注意力头通道数（基于embed_dim）
         self.img_conv = BaseConv(c1, embed_dim, ksize=1, stride=1, act=False) if c1 != embed_dim else None # 映射图像特征到指定维度
         self.text_linear = nn.Linear(guide_dim, embed_dim) # 映射文本特征到指定维度
         self.bias = nn.Parameter(torch.zeros(num_heads))
@@ -79,6 +79,10 @@ class ScoreCompute(nn.Module):
         """Forward process."""
         bs, _, h, w = img_feat.shape
 
+        # 确保text_feat和模型权重的数据类型一致
+        if text_feat.dtype != self.text_linear.weight.dtype:
+            text_feat = text_feat.to(self.text_linear.weight.dtype)
+        
         # 映射文本特征到指定维度 多头格式
         text_feat = self.text_linear(text_feat)
         text_feat = text_feat.view(bs, -1, self.num_heads, self.head_dim)
@@ -301,6 +305,7 @@ class MoPKL(nn.Module):
     def __init__(self, num_classes, num_frame=5):
         super(MoPKL, self).__init__()
         
+        self.num_classes = num_classes
         self.num_frame = num_frame
         self.backbone = Feature_Extractor(0.33,0.50)
         self.fusion = Fusion_Module(channels=[128], num_frame=num_frame)
@@ -348,9 +353,8 @@ class MoPKL(nn.Module):
         
         # 目标类别文本编码器
         self.target_encoder = TargetTextEncoder(num_classes=1, learnable_tokens=7, embed_dim=512)
-        # 生成目标类别文本嵌入
-        target_classes = ['target']
-        self.txt_feats = self.target_encoder.encode_target_classes(target_classes)  # [1, 1, 512]
+        # 目标类别名称
+        self.target_classes = ['target']
         
         # 图像-文本注意力模块
         self.attn = ScoreCompute(self.c, self.c, guide_dim=512, embed_dim=128, num_heads=1)
@@ -387,8 +391,8 @@ class MoPKL(nn.Module):
         feat_list = [feats_part1, feats_part2]  # 初始化为包含feats_part1和feats_part2的列表
         feat_list.extend(m(feat_list[-1]) for m in self.m)  # 使用extend方式应用bottleneck [4, 256 * 3, 64, 64]
         
-        # 使用预生成的文本嵌入
-        text_feat = self.txt_feats  # [1, 1, 512]
+        # 每次forward重新生成文本嵌入，使learnable_ctx的梯度能够传播
+        text_feat = self.target_encoder.encode_target_classes(self.target_classes)  # [1, 1, 512]
         
         # 扩展文本特征以匹配批次大小
         if len(text_feat) != len(feat_list[-1]):
@@ -409,12 +413,15 @@ class MoPKL(nn.Module):
         if self.training: 
             # Language-Driven Motion Alignment
             multi_targets = [mt.cuda() if isinstance(mt, torch.Tensor) else mt for mt in multi_targets]
-            motion_prior = generate_motion(multi_targets, inputs,
-                                                base_kernel_length=1, length_scale=3,
-                                                kernel_width=21, alpha=0.1, sigma=3,
-                                                brightness_factor=0.1, motion_threshold=1e-2) # 得到运动先验热力图
-            motion_prior_cpu = [cp.asnumpy(h) if hasattr(h, 'ndim') else h for h in motion_prior]
-            motion_prior = torch.tensor(np.stack(motion_prior_cpu)).cuda() # 转成torch sensor
+            with torch.no_grad():
+                motion_prior = generate_motion(multi_targets, inputs,
+                                                    base_kernel_length=1, length_scale=3,
+                                                    kernel_width=21, alpha=0.1, sigma=3,
+                                                    brightness_factor=0.1, motion_threshold=1e-2) # 得到运动先验热力图
+                motion_prior_cpu = [cp.asnumpy(h) if hasattr(h, 'ndim') else h for h in motion_prior]
+                # 使用.copy()确保numpy数组是独立的，然后转换为torch张量
+                motion_prior = torch.from_numpy(np.stack(motion_prior_cpu).copy()).float().cuda()
+            # motion_prior作为监督信号，不需要梯度
             motion, loss_alignment = self.motion.train_forward(motion_prior, fused_feat, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
             # 输入参数分别代表：运动先验热力图（由实际框得到），增强特征，最后一帧的语言描述
 
@@ -430,7 +437,7 @@ class MoPKL(nn.Module):
             motion = self.motion.inference_forward(fused_feat)
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
-        feat = self.fusion(motion, fused_feat)
+        feat = self.fusion(motion, feat[-1])
         outputs  = self.head(feat) 
         
         if self.training:
