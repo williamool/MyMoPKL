@@ -356,7 +356,7 @@ class MoPKL(nn.Module):
         self.attn = ScoreCompute(self.c, self.c, guide_dim=512, embed_dim=128, num_heads=1)
         
         # 特征融合
-        self.feat_fusion = BaseConv((3 + 1) * self.c, self.c, k=1, s=1, act=False)  # (1个bottleneck + 1个part2原始 + 1个part1 + 1个注意力) * self.c
+        self.feat_fusion = BaseConv((3 + 1) * self.c, self.c, ksize=1, stride=1, act=False)  # (1个bottleneck + 1个part2原始 + 1个part1 + 1个注意力) * self.c
 
         # 图卷积更新融合特征
         self.graph_update = GraphUpdate(self.c, 64, self.c)
