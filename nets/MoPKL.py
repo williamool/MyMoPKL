@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .darknet import BaseConv, CSPDarknet, CSPLayer, DWConv, Bottleneck
-from .graph_conv import GraphUpdate, update_features_with_gcn, ImagePoolingAttn
+from .graph_conv import MultiScaleAttn
 from einops import rearrange
 import matplotlib.pyplot as plt
 import cv2
@@ -20,90 +20,48 @@ class TargetTextEncoder(nn.Module):
         self.clip_model = None
         self.num_classes = num_classes
         self.embed_dim = embed_dim
-        
-        self._register_ema_compatible_params() # 将可学习上下文注册为模型参数 使其参与训练
-    
+
+        self._register_ema_compatible_params()
+
     def _register_ema_compatible_params(self):
         # 确保参数能被EMA正确捕获
         if self.learnable_ctx is not None:
             self.register_parameter('learnable_ctx', self.learnable_ctx)
-    
+
     def encode_target_classes(self, class_names):
         # 加载CLIP模型
         try:
             import clip
         except ImportError:
             raise ImportError("Please install CLIP: pip install git+https://github.com/ultralytics/CLIP.git")
-        
+
         if self.clip_model is None:
             self.clip_model = clip.load("ViT-B/32")[0]
-        
+
         model = self.clip_model
         device = next(model.parameters()).device
         dtype = model.dtype
-        
-        text_token = torch.cat([clip.tokenize(p) for p in class_names]).to(device) # 文本转token
-        tokenized_prompts = model.token_embedding(text_token)[:, :70, :].type(dtype) # Token映射到高维空间
-        
-        learnable_ctx = self.learnable_ctx.to(device).to(dtype).detach().clone() # 拼接可学习上下文
+
+        text_token = torch.cat([clip.tokenize(p) for p in class_names]).to(device)
+        tokenized_prompts = model.token_embedding(text_token)[:, :70, :].type(dtype)
+
+        learnable_ctx = self.learnable_ctx.to(device).to(dtype).detach().clone()
         x = torch.cat([tokenized_prompts, learnable_ctx], dim=1)
-        
-        x = x + model.positional_embedding.type(dtype) # 加上位置编码
-        
-        # 输入clip Transformer编码
-        x = x.permute(1, 0, 2)  # [77, 1, 512]
-        x = model.transformer(x)  # Transformer编码
-        x = x.permute(1, 0, 2)  # [1, 77, 512]
-        
+
+        x = x + model.positional_embedding.type(dtype)
+
+        x = x.permute(1, 0, 2)
+        x = model.transformer(x)
+        x = x.permute(1, 0, 2)
+
         x = model.ln_final(x).type(dtype)
-        txt_feats = x[torch.arange(x.shape[0]), text_token.argmax(dim=-1)] @ model.text_projection # 提取EOS token特征
-        
-        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True) # 归一化
+        txt_feats = x[torch.arange(x.shape[0]), text_token.argmax(dim=-1)] @ model.text_projection
+
+        txt_feats = txt_feats / txt_feats.norm(p=2, dim=-1, keepdim=True)
         final_embeddings = txt_feats.reshape(-1, len(class_names), txt_feats.shape[-1])
         
         return final_embeddings # [1, 1, 512]
 
-class ScoreCompute(nn.Module):
-
-    def __init__(self, c1, c2, num_heads=1, embed_dim=128, guide_dim=512, scale=False): # 输入/输出通道数 注意力头数 嵌入通道数 文本嵌入通道数 可学习放缩参数
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads # 注意力头以及每个注意力头通道数（基于embed_dim）
-        self.img_conv = BaseConv(c1, embed_dim, ksize=1, stride=1, act=False) if c1 != embed_dim else None # 映射图像特征到指定维度
-        self.text_linear = nn.Linear(guide_dim, embed_dim) # 映射文本特征到指定维度
-        self.bias = nn.Parameter(torch.zeros(num_heads))
-        self.proj_conv = BaseConv(c1, c2, ksize=3, stride=1, act=False) # 将输入特征投影到输出维度
-        self.scale = nn.Parameter(torch.ones(1, num_heads, 1, 1)) if scale else 1.0
-
-    def forward(self, img_feat, text_feat):
-        """Forward process."""
-        bs, _, h, w = img_feat.shape
-
-        # 确保text_feat和模型权重的数据类型一致
-        if text_feat.dtype != self.text_linear.weight.dtype:
-            text_feat = text_feat.to(self.text_linear.weight.dtype)
-        
-        # 映射文本特征到指定维度 多头格式
-        text_feat = self.text_linear(text_feat)
-        text_feat = text_feat.view(bs, -1, self.num_heads, self.head_dim)
-        # 映射图像特征到指定维度 多头格式
-        img_embed = self.img_conv(img_feat) if self.img_conv is not None else img_feat
-        img_embed = img_embed.view(bs, self.num_heads, self.head_dim, h, w)
-
-        # 计算每个像素图像与文本相似度
-        attn_weight = torch.einsum("bmchw,bnmc->bmhwn", img_embed, text_feat)
-        attn_weight = attn_weight.max(dim=-1)[0] # 每个像素取最大注意力得分 单类情况即单类得分
-        attn_weight = attn_weight / (self.head_dim**0.5) # 归一化
-        attn_weight = attn_weight + self.bias[None, :, None, None] # 添加偏置
-        attn_weight = attn_weight.sigmoid() * self.scale # 添加激活
-        score_map = attn_weight.mean(dim=1,keepdim=True) # 对所有注意力头取平均
-        
-        # 映射输入特征到输出维度
-        img_feat = self.proj_conv(img_feat)
-        img_feat = img_feat.view(bs, self.num_heads, -1, h, w)
-        img_feat = img_feat * attn_weight.unsqueeze(2)
-
-        return img_feat.view(bs, -1, h, w), score_map.squeeze(1) # 返回增强特征与得分图
 
 class MotionModel(nn.Module):
     # 初始化，超参数分别控制输入维度、潜在空间大小和隐藏层
@@ -257,7 +215,6 @@ class GATNet(nn.Module):
         x = self.gat1(x, adj)  
         x = self.gat2(x, adj)  
         return x
-
  
 
 class Feature_Extractor(nn.Module):
@@ -286,9 +243,15 @@ class Feature_Extractor(nn.Module):
             act = act,
         ) # 把上采样后的dark45融合特征与dark3进一步融合
 
-    def forward(self, input):
+    def forward(self, input, return_multi_scale=False):
         out_features            = self.backbone.forward(input)
         [feat1, feat2, feat3]   = [out_features[f] for f in self.in_features]
+        
+        if return_multi_scale:
+            # 返回多尺度特征用于语义增强
+            return [feat1, feat2, feat3]  # [dark3, dark4, dark5]
+        
+        # 原有的FPN融合流程
         P5          = self.lateral_conv0(feat3)
         P5_upsample = self.upsample(P5)
         P5_upsample = torch.cat([P5_upsample, feat2], 1)
@@ -299,6 +262,50 @@ class Feature_Extractor(nn.Module):
         P3_out      = self.C3_p3(P4_upsample)  
         
         return P3_out
+
+
+class Feature_Fusion(nn.Module):
+    def __init__(self, in_channels=(128, 256, 512), act="silu", depthwise=False, depth=0.33):
+        super().__init__()
+        c3, c4, c5 = in_channels
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        
+        # P5 -> 1x1 conv to c4, upsample and concat with P4, then CSP
+        self.lateral_conv0 = BaseConv(c5, c4, 1, 1, act=act)
+        self.C3_p4 = CSPLayer(
+            2 * c4,  # concat(P5_up,c4) channels
+            c4,
+            round(3 * depth),
+            False,
+            depthwise=depthwise,
+            act=act,
+        )
+        # Reduce to c3, upsample and concat with P3, then CSP
+        self.reduce_conv1 = BaseConv(c4, c3, 1, 1, act=act)
+        self.C3_p3 = CSPLayer(
+            2 * c3,
+            c3,
+            round(3 * depth),
+            False,
+            depthwise=depthwise,
+            act=act,
+        )
+
+    def forward(self, P3: torch.Tensor, P4: torch.Tensor, P5: torch.Tensor) -> torch.Tensor:
+        # P5 path
+        P5_lat = self.lateral_conv0(P5)
+        P5_up = self.upsample(P5_lat)
+        P4_cat = torch.cat([P5_up, P4], 1)
+        P4_out = self.C3_p4(P4_cat)
+        
+        # P4 to P3
+        P4_red = self.reduce_conv1(P4_out)
+        P4_up = self.upsample(P4_red)
+        P3_cat = torch.cat([P4_up, P3], 1)
+        P3_out = self.C3_p3(P3_cat)
+        
+        return P3_out
+
 
 
 class MoPKL(nn.Module):
@@ -313,7 +320,7 @@ class MoPKL(nn.Module):
         self.conv_vl = nn.Sequential(
             BaseConv(128*2,256,3,1),
             BaseConv(256,256,3,1),
-            BaseConv(256,512,1,1))  # 输出512通道，便于后续划分为两部分
+            BaseConv(256,256,1,1))
         self.conv_m = nn.Sequential(
             BaseConv(1,64,3,2),
             BaseConv(64,128,3,2),
@@ -347,68 +354,54 @@ class MoPKL(nn.Module):
             BaseConv(128,128,1,1))
         self.m2 = nn.Linear(1024,4096)
         
-        # bottleneck模块处理后半特征
-        self.c = 256  # hidden channels
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut=True, expansion=0.5) for _ in range(1))
-        
         # 目标类别文本编码器
         self.target_encoder = TargetTextEncoder(num_classes=1, learnable_tokens=7, embed_dim=512)
         # 目标类别名称
         self.target_classes = ['target']
         
-        # 图像-文本注意力模块
-        self.attn = ScoreCompute(self.c, self.c, guide_dim=512, embed_dim=128, num_heads=1)
-        
-        # 特征融合
-        self.feat_fusion = BaseConv((3 + 1) * self.c, self.c, ksize=1, stride=1, act=False)  # (1个bottleneck + 1个part2原始 + 1个part1 + 1个注意力) * self.c
-
-        # 图卷积更新融合特征
-        self.graph_update = GraphUpdate(self.c, 64, self.c)
-        
-        # 图像池化注意力模块：用于通过图像特征更新文本嵌入
-        self.image_pooling_attn = ImagePoolingAttn(
-            ec=256,           # 嵌入通道数
-            ch=(256,),        # 单一尺度特征图通道数
-            ct=512,           # 文本嵌入通道数
-            nh=8,             # 注意力头数
-            k=3,              # 池化核大小
-            scale=False        # 使用可学习的缩放参数
+        # 多尺度跨帧语义交互模块（与Feature_Extractor(width=0.5)对应：通道为[128,256,512]）
+        self.msa = MultiScaleAttn(
+            level_channels=[128, 256, 512],
+            c_text=512,
+            attn_embed_dim=128,
+            attn_heads=8,
+            gcn_hidden=64,
+            k=3,
         )
-        
+        # 三尺度融合器：将更新后的 P3/P4/P5 融合为高分辨率特征
+        self.p345_fusion = Feature_Fusion(in_channels=(128, 256, 512), act="silu", depthwise=False, depth=0.33)
+        self.q345_fusion = Feature_Fusion(in_channels=(128, 256, 512), act="silu", depthwise=False, depth=0.33)
         
     def forward(self, inputs, descriptions=None, multi_targets=None, relation=None):
         feat = []
         outputs = []
         
-        for i in range(self.num_frame-2,self.num_frame): # 从输入序列取最后两帧
-            f_feats = self.backbone(inputs[:,:,i,:,:]) # 提取特征，inputs参数分别为：Batch size, Channel, 第几帧, Height, Width
-            feat.append(f_feats) # 把特征存到列表feat
-        B, N, W, H = f_feats.shape
-        feats_fused = self.conv_vl(torch.cat(feat,1)).squeeze(1) # 把相邻两帧在通道拼接后做卷积融合 [4, 512, 64, 64]
-        # 按通道划分为两部分
-        feats_part1, feats_part2 = torch.chunk(feats_fused, 2, dim=1)  # 将512通道分为两个256通道
-        # 对后半特征应用bottleneck
-        feat_list = [feats_part1, feats_part2]  # 初始化为包含feats_part1和feats_part2的列表
-        feat_list.extend(m(feat_list[-1]) for m in self.m)  # 使用extend方式应用bottleneck [4, 256 * 3, 64, 64]
+        # 保存多尺度特征图：每帧三个尺度，共两帧，总共6个特征图
+        multi_scale_feats = []  # 存储所有多尺度特征图
+        # [4, 128, 64, 64], [4, 256, 32, 32], [4, 512, 16, 16] 两帧
         
-        # 每次forward重新生成文本嵌入，使learnable_ctx的梯度能够传播
+        for i in range(self.num_frame-2,self.num_frame): # 从输入序列取最后两帧 
+            # 获取该帧的多尺度特征图 [dark3, dark4, dark5]
+            frame_multi_scale = self.backbone(inputs[:,:,i,:,:], return_multi_scale=True)
+            multi_scale_feats.extend(frame_multi_scale)  # 将三个尺度特征图添加到列表中
+            
+        P_feats = multi_scale_feats[0:3]
+        Q_feats = multi_scale_feats[3:6]
+
+        # 文本嵌入（每次forward重新生成，允许learnable_ctx更新）
         text_feat = self.target_encoder.encode_target_classes(self.target_classes)  # [1, 1, 512]
-        
-        # 扩展文本特征以匹配批次大小
-        if len(text_feat) != len(feat_list[-1]):
-            text_feat = text_feat.expand(feat_list[-1].shape[0], -1, -1) # [batch_size, num_classes, 512]
-        
-        # 图像-文本注意力交互，生成得分图
-        attn_feat, score_map = self.attn(feat_list[-1], text_feat)  # 后一部分做图像-文本注意 [4, 256, 64, 64]
-        feat_list.append(attn_feat)  # 新特征拼接
-        fused_feat = self.feat_fusion(torch.cat(feat_list, 1))  # 特征融合 [4, 256, 64, 64]
+        # 扩展到batch
+        if text_feat.shape[0] != inputs.shape[0]:
+            text_feat = text_feat.expand(inputs.shape[0], -1, -1)
 
-        fused_feat = update_features_with_gcn(fused_feat, score_map, self.graph_update, k_ratio=0.007, similarity_threshold=0.5)
-
-        # 使用单一尺度特征图更新文本嵌入
-        single_scale_feats = [fused_feat]
-        enhanced_text_feat = self.image_pooling_attn(single_scale_feats, text_feat)
-        text_feat = enhanced_text_feat
+        # 多尺度跨帧语义交互与更新
+        updated_feats, text_feat = self.msa(P_feats, Q_feats, text_feat)
+        # updated_feats: [P3', P4', P5', Q3', Q4', Q5']
+        
+        # 将当前帧三尺度更新后特征融合为高分辨率输入
+        fused_featP = self.p345_fusion(updated_feats[0], updated_feats[1], updated_feats[2])
+        fused_featQ = self.q345_fusion(updated_feats[3], updated_feats[4], updated_feats[5])
+        fused_feat = self.conv_vl(torch.cat([fused_featP, fused_featQ],1)).squeeze(1)
 
         if self.training: 
             # Language-Driven Motion Alignment
@@ -425,19 +418,22 @@ class MoPKL(nn.Module):
             motion, loss_alignment = self.motion.train_forward(motion_prior, fused_feat, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
             # 输入参数分别代表：运动先验热力图（由实际框得到），增强特征，最后一帧的语言描述
 
-            # Motion-Relation Learning
-            v_feat = self.vf(fused_feat) # 视觉特征转换，从256通道降到16通道 [4, 16, 32, 32]
-            v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示 把每个空间位置当作一个图节点 每个节点n维特征
-            h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
-            h_i = h.unsqueeze(2) 
-            h_j = h.unsqueeze(1)
-            pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
-            loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
+            # Motion-Relation Learning - 注释掉这部分
+            # v_feat = self.vf(fused_feat) # 视觉特征转换，从256通道降到16通道 [4, 16, 32, 32]
+            # v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示 把每个空间位置当作一个图节点 每个节点n维特征
+            # h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
+            # h_i = h.unsqueeze(2) 
+            # h_j = h.unsqueeze(1)
+            # pred_relation = torch.sum(h_i * h_j, dim=-1) # 通过内积计算两个节点间相似度
+            # loss_relation = F.mse_loss(pred_relation, relation.squeeze(1))
+            
+            # 将relation loss置为0
+            loss_relation = torch.tensor(0.0, device=fused_feat.device, requires_grad=True)
         else:   
             motion = self.motion.inference_forward(fused_feat)
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
-        feat = self.fusion(motion, feat[-1])
+        feat = self.fusion(motion, fused_featQ)
         outputs  = self.head(feat) 
         
         if self.training:
@@ -445,8 +441,6 @@ class MoPKL(nn.Module):
         else:
             return outputs
 
-
-            
 
 def add_comet_kernel(heatmap, head_center, tail_angle, kernel_length=61, kernel_width=21, 
                      alpha=0.1, sigma=3, brightness_scale=1.0):
@@ -613,9 +607,6 @@ class Fusion_Module(nn.Module):
         return [fused_res]
 
 
-
-
-    
 
 class YOLOXHead(nn.Module):
     def __init__(self, num_classes, width = 1.0, in_channels = [16, 32, 64], act = "silu"):

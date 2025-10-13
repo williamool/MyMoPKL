@@ -2,7 +2,169 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
+from .darknet import BaseConv, Bottleneck
 
+class MultiScaleAttn(nn.Module):
+    def __init__(
+        self,
+        level_channels: list,         # [c3, c4, c5]
+        c_text: int = 512,
+        attn_embed_dim: int = 128,
+        attn_heads: int = 8,
+        gcn_hidden: int = 64,
+        k: int = 3,
+    ) -> None:
+        super().__init__()
+        assert len(level_channels) == 3, "level_channels should be [c3, c4, c5]"
+        c3, c4, c5 = level_channels
+
+        # 每个尺度一套FeatureUpdate（共享于P/Q该尺度）
+        self.update_l3 = FeatureUpdate(c_in=c3, c_out=c3, n=1, c_hidden=attn_embed_dim,
+                                       num_head=1, c_text=c_text, gcn_hidden=gcn_hidden,
+                                       attn_embed_dim=attn_embed_dim)
+        self.update_l4 = FeatureUpdate(c_in=c4, c_out=c4, n=1, c_hidden=attn_embed_dim,
+                                       num_head=1, c_text=c_text, gcn_hidden=gcn_hidden,
+                                       attn_embed_dim=attn_embed_dim)
+        self.update_l5 = FeatureUpdate(c_in=c5, c_out=c5, n=1, c_hidden=attn_embed_dim,
+                                       num_head=1, c_text=c_text, gcn_hidden=gcn_hidden,
+                                       attn_embed_dim=attn_embed_dim)
+
+        # 文本增强：使用 P3'、P4、P5 三尺度更新文本
+        self.image_pooling_attn = ImagePoolingAttn(
+            ec=attn_embed_dim,
+            ch=(c3, c4, c5),
+            ct=c_text,
+            nh=attn_heads,
+            k=k,
+            scale=False,
+        )
+
+    def forward(self, P_feats: list, Q_feats: list, text_feat: torch.Tensor):
+        # 解包并校验
+        assert len(P_feats) == 3 and len(Q_feats) == 3, "Expect three scales for P and Q"
+        P3, P4, P5 = P_feats
+        Q3, Q4, Q5 = Q_feats
+
+        # 1) 更新最高分辨率尺度 P3、Q3
+        P3_upd = self.update_l3(P3, text_feat)
+        Q3_upd = self.update_l3(Q3, text_feat)
+
+        # 2) 用 [P3', P4, P5] 更新文本特征
+        text_feat_upd = self.image_pooling_attn([P3_upd, P4, P5], text_feat)
+
+        # 3) 用新的文本特征依次更新 P4、P5、Q4、Q5
+        P4_upd = self.update_l4(P4, text_feat_upd)
+        P5_upd = self.update_l5(P5, text_feat_upd)
+        Q4_upd = self.update_l4(Q4, text_feat_upd)
+        Q5_upd = self.update_l5(Q5, text_feat_upd)
+
+        return [P3_upd, P4_upd, P5_upd, Q3_upd, Q4_upd, Q5_upd], text_feat_upd
+
+class FeatureUpdate(nn.Module):
+    def __init__(
+        self,
+        c_in: int,
+        c_out: int,
+        n: int = 1,
+        c_hidden: int = 128,
+        num_head: int = 1,
+        c_text: int = 512,
+        gcn_hidden: int = 64,
+        attn_embed_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        assert c_in % 2 == 0, "c_in must be divisible by 2 to split channels"
+        self.c_in = c_in
+        self.c_half = c_in // 2
+        self.c_out = c_out
+
+        # 后半部分的bottleneck序列
+        self.m = nn.ModuleList(
+            Bottleneck(self.c_half, self.c_half, shortcut=True, expansion=0.5) for _ in range(n)
+        )
+
+        # 图像-文本注意力，输入输出均为c_half
+        self.attn = ScoreCompute(
+            c1=self.c_half,
+            c2=self.c_half,
+            num_heads=num_head,
+            embed_dim=attn_embed_dim,
+            guide_dim=c_text,
+            scale=False,
+        )
+
+        # 特征融合：(part1, part2, bottleneck(part2), attn) 共4块，每块c_half通道
+        self.feat_fusion = BaseConv((n + 3) * self.c_half, self.c_out, ksize=1, stride=1, act=False)
+
+        # 图卷积更新模块：通道保持不变
+        self.graph_update = GraphUpdate(self.c_out, gcn_hidden, self.c_out)
+
+    def forward(self, x: torch.Tensor, text_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, c_in, H, W]
+            text_feat: [B, num_classes, c_text]
+        Returns:
+            fused_feat: [B, c_out, H, W]
+        """
+        # 1) 按通道划分为两部分
+        feats_part1, feats_part2 = torch.chunk(x, 2, dim=1)
+
+        # 2) 对后半特征应用bottleneck（extend方式）
+        feat_list = [feats_part1, feats_part2]
+        feat_list.extend(m(feat_list[-1]) for m in self.m)
+
+        # 3) 图像-文本注意力，得到attn特征和得分图
+        attn_feat, score_map = self.attn(feat_list[-1], text_feat)
+
+        # 4) 新特征拼接并融合
+        feat_list.append(attn_feat)
+        fused_feat = self.feat_fusion(torch.cat(feat_list, 1))
+
+        # 5) 基于得分图的GCN特征更新
+        fused_feat = update_features_with_gcn(
+            fused_feat, score_map, self.graph_update, k_ratio=0.005, similarity_threshold=0.5
+        )
+
+        return fused_feat
+
+
+class ScoreCompute(nn.Module):
+    def __init__(self, c1, c2, num_heads=1, embed_dim=128, guide_dim=512, scale=False):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        from .darknet import BaseConv  # local import to avoid circular at module load
+        self.img_conv = BaseConv(c1, embed_dim, ksize=1, stride=1, act=False) if c1 != embed_dim else None
+        self.text_linear = nn.Linear(guide_dim, embed_dim)
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+        self.proj_conv = BaseConv(c1, c2, ksize=3, stride=1, act=False)
+        self.scale = nn.Parameter(torch.ones(1, num_heads, 1, 1)) if scale else 1.0
+
+    def forward(self, img_feat, text_feat):
+        bs, _, h, w = img_feat.shape
+
+        if text_feat.dtype != self.text_linear.weight.dtype:
+            text_feat = text_feat.to(self.text_linear.weight.dtype)
+
+        text_feat = self.text_linear(text_feat)
+        text_feat = text_feat.view(bs, -1, self.num_heads, self.head_dim)
+
+        img_embed = self.img_conv(img_feat) if self.img_conv is not None else img_feat
+        img_embed = img_embed.view(bs, self.num_heads, self.head_dim, h, w)
+
+        attn_weight = torch.einsum("bmchw,bnmc->bmhwn", img_embed, text_feat)
+        attn_weight = attn_weight.max(dim=-1)[0]
+        attn_weight = attn_weight / (self.head_dim**0.5)
+        attn_weight = attn_weight + self.bias[None, :, None, None]
+        attn_weight = attn_weight.sigmoid() * self.scale
+        score_map = attn_weight.mean(dim=1, keepdim=True)
+
+        img_feat = self.proj_conv(img_feat)
+        img_feat = img_feat.view(bs, self.num_heads, -1, h, w)
+        img_feat = img_feat * attn_weight.unsqueeze(2)
+
+        return img_feat.view(bs, -1, h, w), score_map.squeeze(1)
 
 class GraphUpdate(nn.Module):
     """Graph-based feature update module."""
