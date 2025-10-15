@@ -129,14 +129,12 @@ class YOLOLoss(nn.Module):
         bbox_preds  = outputs[:, :, :4]   #4, 4096, 4
         
         #-----------------------------------------------#
-        #   [batch, n_anchors_all, 1]
+        #   [batch, n_anchors_all, n_cls] - 新的CLIP相似度输出
         #-----------------------------------------------#
-        obj_preds   = outputs[:, :, 4:5]
+        cls_preds   = outputs[:, :, 4:]   # 4+: CLIP相似度 (替代obj+cls)
         
-        #-----------------------------------------------#
-        #   [batch, n_anchors_all, n_cls]
-        #-----------------------------------------------#
-        cls_preds   = outputs[:, :, 5:]  
+        # 为了兼容性，创建一个虚拟的obj_preds (全为1)
+        obj_preds   = torch.ones_like(cls_preds[:, :, :1])  # [batch, n_anchors_all, 1]  
         
         total_num_anchors   = outputs.shape[1]
         #-----------------------------------------------#
@@ -196,7 +194,8 @@ class YOLOLoss(nn.Module):
 
         num_fg      = max(num_fg, 1)
         loss_iou    = (self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets)).sum()
-        loss_obj    = (self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)).sum()
+        # 由于删除了objectness分支，obj损失设为0
+        loss_obj    = torch.tensor(0.0, device=loss_iou.device, dtype=loss_iou.dtype)
         loss_cls    = (self.bcewithlog_loss(cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets)).sum()
         # loss_obj    = (sigmoid_focal_loss(obj_preds.view(-1, 1), obj_targets)).sum()
         # loss_cls    = (sigmoid_focal_loss(cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets)).sum()
@@ -236,13 +235,13 @@ class YOLOLoss(nn.Module):
         #-------------------------------------------------------#
         if self.fp16:
             with torch.cuda.amp.autocast(enabled=False):
-                cls_preds_          = cls_preds_.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_() * obj_preds_.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
+                cls_preds_          = cls_preds_.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid() * obj_preds_.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid()
                 gt_cls_per_image    = F.one_hot(gt_classes.to(torch.int64), self.num_classes).float().unsqueeze(1).repeat(1, num_in_boxes_anchor, 1)
-                pair_wise_cls_loss  = F.binary_cross_entropy(cls_preds_.sqrt_(), gt_cls_per_image, reduction="none").sum(-1)
+                pair_wise_cls_loss  = F.binary_cross_entropy(torch.sqrt(cls_preds_), gt_cls_per_image, reduction="none").sum(-1)
         else:
-            cls_preds_          = cls_preds_.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_() * obj_preds_.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
+            cls_preds_          = cls_preds_.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid() * obj_preds_.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid()
             gt_cls_per_image    = F.one_hot(gt_classes.to(torch.int64), self.num_classes).float().unsqueeze(1).repeat(1, num_in_boxes_anchor, 1)
-            pair_wise_cls_loss  = F.binary_cross_entropy(cls_preds_.sqrt_(), gt_cls_per_image, reduction="none").sum(-1)
+            pair_wise_cls_loss  = F.binary_cross_entropy(torch.sqrt(cls_preds_), gt_cls_per_image, reduction="none").sum(-1)
             del cls_preds_
 
         cost = pair_wise_cls_loss + 3.0 * pair_wise_ious_loss + 100000.0 * (~is_in_boxes_and_center).float()

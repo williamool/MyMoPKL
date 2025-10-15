@@ -1,3 +1,4 @@
+from PIL.ExifTags import Base
 import numpy as np
 import math
 import torch
@@ -315,8 +316,13 @@ class MoPKL(nn.Module):
         self.num_classes = num_classes
         self.num_frame = num_frame
         self.backbone = Feature_Extractor(0.33,0.50)
-        self.fusion = Fusion_Module(channels=[128], num_frame=num_frame)
-        self.head = YOLOXHead(num_classes=num_classes, width = 1.0, in_channels = [256], act = "silu")
+        self.fusion = Motion_Fusion_Module(channels=[128, 256, 512], num_frame=num_frame)
+        self.head = YOLOXHead_CLIP(
+            num_classes=num_classes,
+            width=1.0,
+            in_channels=[256, 512, 1024],  # 多尺度输入
+            act="silu",
+            embed_dim=512)
         self.conv_vl = nn.Sequential(
             BaseConv(128*2,256,3,1),
             BaseConv(256,256,3,1),
@@ -394,6 +400,7 @@ class MoPKL(nn.Module):
         if text_feat.shape[0] != inputs.shape[0]:
             text_feat = text_feat.expand(inputs.shape[0], -1, -1)
 
+        text_feat_origin = text_feat
         # 多尺度跨帧语义交互与更新
         updated_feats, text_feat = self.msa(P_feats, Q_feats, text_feat)
         # updated_feats: [P3', P4', P5', Q3', Q4', Q5']
@@ -418,7 +425,7 @@ class MoPKL(nn.Module):
             motion, loss_alignment = self.motion.train_forward(motion_prior, fused_feat, descriptions[:,-1,:,:], alpha=1.0, beta=1.0) 
             # 输入参数分别代表：运动先验热力图（由实际框得到），增强特征，最后一帧的语言描述
 
-            # Motion-Relation Learning - 注释掉这部分
+            # Motion-Relation Learning
             # v_feat = self.vf(fused_feat) # 视觉特征转换，从256通道降到16通道 [4, 16, 32, 32]
             # v_feat = rearrange(v_feat, 'b n w h -> b n (w h)', b=B, n=16, w=32, h=32) # 转换成节点表示 把每个空间位置当作一个图节点 每个节点n维特征
             # h = self.GAT(v_feat, relation.squeeze(1)) # 用节点特征和邻接矩阵建图
@@ -433,8 +440,8 @@ class MoPKL(nn.Module):
             motion = self.motion.inference_forward(fused_feat)
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
-        feat = self.fusion(motion, fused_featQ)
-        outputs  = self.head(feat) 
+        feat = self.fusion(motion, [updated_feats[3], updated_feats[4], updated_feats[5]])
+        outputs = self.head(feat, text_feat_origin)
         
         if self.training:
             return outputs, loss_alignment + loss_relation
@@ -565,95 +572,264 @@ class CBAMBlock(nn.Module):
         x = x * scale_spatial
         return x
 
-class Fusion_Module(nn.Module):
-    def __init__(self, channels=[128, 256, 512], num_frame=5):
-        super(Fusion_Module, self).__init__()
-        self.k_conv = BaseConv(channels[0], channels[0] * 2, 3, 1, 1)
-        self.fusion_conv = BaseConv(channels[0] * 4, channels[0] * 2, 3, 1, 1)
-        self.cbam = CBAMBlock(channels[0] * 4, reduction=16, kernel_size=7)
-        mid_channels = channels[0] * 2  # 256
-        self.pre_conv = BaseConv(channels[0] * 4, mid_channels, 1, 1)
-        self.upsample_branch = nn.Sequential(
-            nn.UpsamplingBilinear2d(scale_factor=2),
-            BaseConv(mid_channels, mid_channels, 3, 1, 1)
-        )
-        self.dilated1 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=1, padding=1)
-        self.dilated2 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=2, padding=2)
-        self.dilated3 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=4, padding=4)
-        self.dilated_fuse = BaseConv(mid_channels * 3, mid_channels, 1, 1)
-        self.merge_scale = BaseConv(mid_channels * 2, channels[0] * 2, 3, 1)
-        self.residual_conv = nn.Sequential(
-            BaseConv(channels[0] * 4, channels[0] * 2, 1, 1),
-            nn.BatchNorm2d(channels[0] * 2)
-        )
+# class Fusion_Module(nn.Module):
+#     def __init__(self, channels=[128, 256, 512], num_frame=5):
+#         super(Fusion_Module, self).__init__()
+#         self.k_conv = BaseConv(channels[0], channels[0] * 2, 3, 1, 1)
+#         self.fusion_conv = BaseConv(channels[0] * 4, channels[0] * 2, 3, 1, 1)
+#         self.cbam = CBAMBlock(channels[0] * 4, reduction=16, kernel_size=7)
+#         mid_channels = channels[0] * 2  # 256
+#         self.pre_conv = BaseConv(channels[0] * 4, mid_channels, 1, 1)
+#         self.upsample_branch = nn.Sequential(
+#             nn.UpsamplingBilinear2d(scale_factor=2),
+#             BaseConv(mid_channels, mid_channels, 3, 1, 1)
+#         )
+#         self.dilated1 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=1, padding=1)
+#         self.dilated2 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=2, padding=2)
+#         self.dilated3 = DBaseConv(mid_channels, mid_channels, 3, 1, dilation=4, padding=4)
+#         self.dilated_fuse = BaseConv(mid_channels * 3, mid_channels, 1, 1)
+#         self.merge_scale = BaseConv(mid_channels * 2, channels[0] * 2, 3, 1)
+#         self.residual_conv = nn.Sequential(
+#             BaseConv(channels[0] * 4, channels[0] * 2, 1, 1),
+#             nn.BatchNorm2d(channels[0] * 2)
+#         )
+#         
+#     def forward(self, motion, k_feat):
+#         k_feat_trans = self.k_conv(k_feat)
+#         fused = torch.cat([motion, k_feat_trans], dim=1) # motion特征与视觉特征在通道维度对齐
+#         att = self.cbam(fused) # CBAM自注意力加权融合特征
+#         pre_feat = self.pre_conv(att) # 通道压缩
+#         up_feat = self.upsample_branch(pre_feat) # 上采样
+#         d1 = self.dilated1(pre_feat) 
+#         d2 = self.dilated2(pre_feat)  
+#         d3 = self.dilated3(pre_feat) 
+#         dilated_out = torch.cat([d1, d2, d3], dim=1) 
+#         dilated_out = self.dilated_fuse(dilated_out) # 三种不同空洞率卷积，提取多尺度信息再融合
+#         up_feat_down = F.interpolate(up_feat, size=pre_feat.shape[2:], mode='bilinear', align_corners=False)
+#         multi_scale_fused = torch.cat([dilated_out, up_feat_down], dim=1)
+#         multi_scale_fused = self.merge_scale(multi_scale_fused) # 把上采样特征和dilated融合特征拼接融合          
+#         fused_out = self.fusion_conv(att) 
+#         fused_out_final = fused_out + multi_scale_fused
+#         fused_res = fused_out_final + self.residual_conv(fused)
+#         return [fused_res]
+
+class Motion_Fusion_Module(nn.Module):
+    def __init__(self, channels=[128, 256, 512], motion_channels=256, num_frame=5):
+        super(Motion_Fusion_Module, self).__init__()
         
-    def forward(self, motion, k_feat):
-        k_feat_trans = self.k_conv(k_feat)
-        fused = torch.cat([motion, k_feat_trans], dim=1) # motion特征与视觉特征在通道维度对齐
-        att = self.cbam(fused) # CBAM自注意力加权融合特征
-        pre_feat = self.pre_conv(att) # 通道压缩
-        up_feat = self.upsample_branch(pre_feat) # 上采样
-        d1 = self.dilated1(pre_feat) 
-        d2 = self.dilated2(pre_feat)  
-        d3 = self.dilated3(pre_feat) 
-        dilated_out = torch.cat([d1, d2, d3], dim=1) 
-        dilated_out = self.dilated_fuse(dilated_out) # 三种不同空洞率卷积，提取多尺度信息再融合
-        up_feat_down = F.interpolate(up_feat, size=pre_feat.shape[2:], mode='bilinear', align_corners=False)
-        multi_scale_fused = torch.cat([dilated_out, up_feat_down], dim=1)
-        multi_scale_fused = self.merge_scale(multi_scale_fused) # 把上采样特征和dilated融合特征拼接融合          
-        fused_out = self.fusion_conv(att) 
-        fused_out_final = fused_out + multi_scale_fused
-        fused_res = fused_out_final + self.residual_conv(fused)
-        return [fused_res]
+        self.channels = channels
+        self.motion_channels = motion_channels
+
+        # 若输入通道 c == 128，则不进行通道变换
+        self.motion_align = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(motion_channels, c * 2, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(c * 2),
+                nn.SiLU()
+            ) if c != 128 else nn.Identity()   # 若为128，则不变
+            for c in channels
+        ])
+
+        self.k_conv = nn.ModuleList([BaseConv(c, c * 2, 3, 1, 1) for c in channels])               # 视觉特征通道扩展
+        self.fusion_conv = nn.ModuleList([BaseConv(c * 4, c * 2, 3, 1, 1) for c in channels])       # 最终融合层
+        self.cbam = nn.ModuleList([CBAMBlock(c * 4, reduction=16, kernel_size=7) for c in channels]) # 注意力模块
+        self.pre_conv = nn.ModuleList([BaseConv(c * 4, c * 2, 1, 1) for c in channels])             # 通道压缩
+        self.upsample_branch = nn.ModuleList([
+            nn.Sequential(
+                nn.UpsamplingBilinear2d(scale_factor=2),
+                BaseConv(c * 2, c * 2, 3, 1, 1)
+            ) for c in channels
+        ])
+
+        # 多尺度空洞卷积分支
+        self.dilated1 = nn.ModuleList([DBaseConv(c * 2, c * 2, 3, 1, dilation=1, padding=1) for c in channels])
+        self.dilated2 = nn.ModuleList([DBaseConv(c * 2, c * 2, 3, 1, dilation=2, padding=2) for c in channels])
+        self.dilated3 = nn.ModuleList([DBaseConv(c * 2, c * 2, 3, 1, dilation=4, padding=4) for c in channels])
+        self.dilated_fuse = nn.ModuleList([BaseConv(c * 2 * 3, c * 2, 1, 1) for c in channels])     # 三空洞融合
+
+        # 多尺度特征融合与残差增强
+        self.merge_scale = nn.ModuleList([BaseConv(c * 2 * 2, c * 2, 3, 1) for c in channels])
+        self.residual_conv = nn.ModuleList([
+            nn.Sequential(
+                BaseConv(c * 4, c * 2, 1, 1),
+                nn.BatchNorm2d(c * 2)
+            ) for c in channels
+        ])
+
+    def forward(self, motion, k_feats):
+        fused_feats = []
+        for i, k_feat in enumerate(k_feats):
+            in_c = k_feat.shape[1]
+            # Step1: 将motion resize到当前尺度
+            motion_resized = F.interpolate(motion, size=k_feat.shape[2:], mode='bilinear', align_corners=False)
+
+            # Step2: 若当前尺度通道为128，则跳过motion通道映射
+            motion_aligned = self.motion_align[i](motion_resized)
+
+            # Step3: 视觉特征通道扩展 + 融合
+            k_feat_trans = self.k_conv[i](k_feat)
+            fused = torch.cat([motion_aligned, k_feat_trans], dim=1)  # [B, in_c*4, H, W]
+
+            # Step4: 注意力增强 + 多尺度空洞卷积融合
+            att = self.cbam[i](fused)
+            pre_feat = self.pre_conv[i](att)
+            up_feat = self.upsample_branch[i](pre_feat)
+
+            # 多尺度空洞卷积增强
+            d1 = self.dilated1[i](pre_feat)
+            d2 = self.dilated2[i](pre_feat)
+            d3 = self.dilated3[i](pre_feat)
+            dilated_out = torch.cat([d1, d2, d3], dim=1)
+            dilated_out = self.dilated_fuse[i](dilated_out)
+
+            # 上采样结果对齐再融合
+            up_feat_down = F.interpolate(up_feat, size=pre_feat.shape[2:], mode='bilinear', align_corners=False)
+            multi_scale_fused = torch.cat([dilated_out, up_feat_down], dim=1)
+            multi_scale_fused = self.merge_scale[i](multi_scale_fused)
+
+            # Step5: 残差连接与最终输出
+            fused_out = self.fusion_conv[i](att)
+            fused_out_final = fused_out + multi_scale_fused
+            fused_res = fused_out_final + self.residual_conv[i](fused)
+
+            fused_feats.append(fused_res)
+
+        return fused_feats
+      
+
+# class YOLOXHead(nn.Module):
+#     def __init__(self, num_classes, width = 1.0, in_channels = [16, 32, 64], act = "silu"):
+#         super().__init__()
+#         Conv            =  BaseConv
+#         
+#         self.cls_convs  = nn.ModuleList()
+#         self.reg_convs  = nn.ModuleList()
+#         self.cls_preds  = nn.ModuleList()
+#         self.reg_preds  = nn.ModuleList()
+#         self.obj_preds  = nn.ModuleList()
+#         self.stems      = nn.ModuleList()
+#         
+#         for i in range(len(in_channels)):
+#             self.stems.append(BaseConv(in_channels = int(in_channels[i] * width), out_channels = int(256 * width), ksize = 1, stride = 1, act = act))
+#             self.cls_convs.append(nn.Sequential(*[
+#                 Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
+#                 Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
+#             ]))
+#             self.cls_preds.append(
+#                 nn.Conv2d(in_channels = int(256 * width), out_channels = num_classes, kernel_size = 1, stride = 1, padding = 0)
+#             )
+#             
+#             self.reg_convs.append(nn.Sequential(*[
+#                 Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
+#                 Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act)
+#             ]))
+#             self.reg_preds.append(
+#                 nn.Conv2d(in_channels = int(256 * width), out_channels = 4, kernel_size = 1, stride = 1, padding = 0)
+#             )
+#             self.obj_preds.append(
+#                 nn.Conv2d(in_channels = int(256 * width), out_channels = 1, kernel_size = 1, stride = 1, padding = 0)
+#             )
+#         
+#     def forward(self, inputs):
+#         
+#         outputs = []
+#         for k, x in enumerate(inputs):
+#             x       = self.stems[k](x)
+#             cls_feat    = self.cls_convs[k](x)
+#             cls_output  = self.cls_preds[k](cls_feat)
+#             reg_feat    = self.reg_convs[k](x)
+#             reg_output  = self.reg_preds[k](reg_feat)
+#             obj_output  = self.obj_preds[k](reg_feat)
+#             output      = torch.cat([reg_output, obj_output, cls_output], 1)
+#             outputs.append(output)
+#         return outputs
 
 
-
-class YOLOXHead(nn.Module):
-    def __init__(self, num_classes, width = 1.0, in_channels = [16, 32, 64], act = "silu"):
+class ContrastiveHead(nn.Module):
+    """CLIP式图文相似度：x=[B,E,H,W], w=[B,C,E] -> [B,C,H,W]"""
+    def __init__(self):
         super().__init__()
-        Conv            =  BaseConv
-        
-        self.cls_convs  = nn.ModuleList()
-        self.reg_convs  = nn.ModuleList()
-        self.cls_preds  = nn.ModuleList()
-        self.reg_preds  = nn.ModuleList()
-        self.obj_preds  = nn.ModuleList()
+        self.bias = nn.Parameter(torch.tensor([-10.0]))
+        self.logit_scale = nn.Parameter(torch.ones([]) * torch.tensor(1/0.07).log())
+
+    def forward(self, x, w):
+        # Align dtype/device to avoid Half/Float mismatch under AMP
+        if w.dtype != x.dtype or w.device != x.device:
+            w = w.to(dtype=x.dtype, device=x.device)
+
+        x = F.normalize(x, dim=1, p=2)
+        w = F.normalize(w, dim=-1, p=2)
+        sim = torch.einsum("b e h w, b c e -> b c h w", x, w)
+
+        scale = self.logit_scale.exp().to(dtype=x.dtype)
+        bias = self.bias.to(dtype=x.dtype)
+        return sim * scale + bias
+
+
+class YOLOXHead_CLIP(nn.Module):
+    """
+    YOLOX检测头 + CLIP对齐分支
+    每尺度输出通道: [reg(4), simmap(C)] => 4 + C
+    删除obj和传统cls，用CLIP相似度替代
+    """
+    def __init__(self, num_classes, in_channels=(256, 512, 1024), embed_dim=512, width=1.0, act="silu"):
+        super().__init__()
+        Conv = BaseConv
+
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.in_channels = list(in_channels)
+        self.nl = len(self.in_channels)
+        hidden_c = int(256 * width)
+
         self.stems      = nn.ModuleList()
+        self.reg_convs  = nn.ModuleList()
+        self.reg_preds  = nn.ModuleList()
+        self.cv3        = nn.ModuleList()      # 视觉->文本嵌入空间投影
+        self.cv4        = nn.ModuleList()      # 对比相似度头
 
-        for i in range(len(in_channels)):
-            self.stems.append(BaseConv(in_channels = int(in_channels[i] * width), out_channels = int(256 * width), ksize = 1, stride = 1, act = act))
-            self.cls_convs.append(nn.Sequential(*[
-                Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
-                Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
-            ]))
-            self.cls_preds.append(
-                nn.Conv2d(in_channels = int(256 * width), out_channels = num_classes, kernel_size = 1, stride = 1, padding = 0)
-            )
-            
-            self.reg_convs.append(nn.Sequential(*[
-                Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act), 
-                Conv(in_channels = int(256 * width), out_channels = int(256 * width), ksize = 3, stride = 1, act = act)
-            ]))
-            self.reg_preds.append(
-                nn.Conv2d(in_channels = int(256 * width), out_channels = 4, kernel_size = 1, stride = 1, padding = 0)
-            )
-            self.obj_preds.append(
-                nn.Conv2d(in_channels = int(256 * width), out_channels = 1, kernel_size = 1, stride = 1, padding = 0)
-            )
+        for c_in in self.in_channels:
+            # stem
+            self.stems.append(Conv(int(c_in*width), hidden_c, 1, 1, act=act))
 
-    def forward(self, inputs):
-        
+            # 回归分支
+            self.reg_convs.append(nn.Sequential(
+                Conv(hidden_c, hidden_c, 3, 1, act=act),
+                Conv(hidden_c, hidden_c, 3, 1, act=act),
+            ))
+            self.reg_preds.append(nn.Conv2d(hidden_c, 4, 1, 1, 0))
+
+            # CLIP投影 + 相似度
+            self.cv3.append(nn.Sequential(
+                Conv(hidden_c, hidden_c, 3, 1, act=act),
+                Conv(hidden_c, hidden_c, 3, 1, act=act),
+                nn.Conv2d(hidden_c, embed_dim, 1, 1, 0),
+            ))
+            self.cv4.append(ContrastiveHead())
+
+    def forward(self, feats, text_embeds):
+        """
+        feats: list of [B, C_i, H_i, W_i]
+        text_embeds: [B, num_classes, embed_dim]
+        return: list of [B, 4+C, H_i, W_i]
+        """
+        assert len(feats) == self.nl
         outputs = []
-        for k, x in enumerate(inputs):
-            x       = self.stems[k](x)
-            cls_feat    = self.cls_convs[k](x)
-            cls_output  = self.cls_preds[k](cls_feat)
-            reg_feat    = self.reg_convs[k](x)
-            reg_output  = self.reg_preds[k](reg_feat)
-            obj_output  = self.obj_preds[k](reg_feat)
-            output      = torch.cat([reg_output, obj_output, cls_output], 1)
-            outputs.append(output)
+
+        for i, x_in in enumerate(feats):
+            x = self.stems[i](x_in)                     # [B, hidden, H, W]
+
+            # 回归分支
+            reg_feat   = self.reg_convs[i](x)
+            reg_out    = self.reg_preds[i](reg_feat)    # [B, 4, H, W]
+
+            # CLIP相似度分支（替代传统分类和objectness）
+            proj   = self.cv3[i](x)                     # [B, E, H, W]
+            simmap = self.cv4[i](proj, text_embeds)     # [B, C, H, W]
+
+            # 拼接: bbox回归 + CLIP相似度
+            out = torch.cat([reg_out, simmap], dim=1)  # [B, 4+C, H, W]
+            outputs.append(out)
+
         return outputs
-
-
 
