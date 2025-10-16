@@ -29,7 +29,8 @@ def decode_outputs(outputs, input_shape):
     strides = []
     hw      = [x.shape[-2:] for x in outputs]
     outputs = torch.cat([x.flatten(start_dim=2) for x in outputs], dim=2).permute(0, 2, 1)
-    outputs[:, :, 4:] = torch.sigmoid(outputs[:, :, 4:])
+    # 注意：新格式中第4维开始是文本相似度得分，不需要sigmoid
+    # outputs[:, :, 4:] = torch.sigmoid(outputs[:, :, 4:])  # 注释掉，文本相似度得分不需要sigmoid
     for h, w in hw:
        
         grid_y, grid_x  = torch.meshgrid([torch.arange(h), torch.arange(w)], indexing='ij')  
@@ -62,19 +63,21 @@ def non_max_suppression(prediction, num_classes, input_shape, image_shape, lette
     
     for i, image_pred in enumerate(prediction):
         
-        class_conf, class_pred = torch.max(image_pred[:, 5:5 + num_classes], 1, keepdim=True)
-        conf_mask = (image_pred[:, 4] * class_conf[:, 0] >= conf_thres).squeeze()
+        # 新格式：[reg(4), simmap(num_classes)] = 4 + num_classes 通道
+        # 文本相似度得分替换了objectness，直接作为置信度
+        class_conf, class_pred = torch.max(image_pred[:, 4:4 + num_classes], 1, keepdim=True)
+        conf_mask = (class_conf[:, 0] >= conf_thres).squeeze()
 
         if not image_pred.size(0):
             continue
         
-        detections = torch.cat((image_pred[:, :5], class_conf, class_pred.float()), 1)
+        detections = torch.cat((image_pred[:, :4], class_conf, class_pred.float()), 1)
         detections = detections[conf_mask]
         
         nms_out_index = boxes.batched_nms(
             detections[:, :4],
-            detections[:, 4] * detections[:, 5],
-            detections[:, 6],
+            detections[:, 4],  # 直接使用文本相似度得分作为置信度
+            detections[:, 5],  # 类别ID
             nms_thres,
         )
 

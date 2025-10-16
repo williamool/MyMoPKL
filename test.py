@@ -1,7 +1,7 @@
 import json
 import os
 import colorsys
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from nets.MoPKL import MoPKL
 from utils.utils import (cvtColor, get_classes, preprocess_input, resize_image,
                          show_config)
@@ -16,20 +16,20 @@ from utils.utils import cvtColor, get_classes, preprocess_input, resize_image
 from utils.utils_bbox import decode_outputs, non_max_suppression
 
 map_mode            = 0
-cocoGt_path         = 'D:/Github/ITSDT/annotations/instances_test2017.json'
-dataset_img_path    = 'D:/Github/ITSDT/'
+cocoGt_path         = '/home/wanboling/disk2/ITSDT/annotations/instances_test2017_fixed.json'
+dataset_img_path    = '/home/wanboling/disk2/ITSDT'
 # cocoGt_path         = '/home/public/DAUB/test.json'
 # dataset_img_path    = '/home/public/DAUB/'
 # cocoGt_path         = '/home/public/IRDST-H/test.json'
 # dataset_img_path    = '/home/public/IRDST-H/'
 
-temp_save_path      = 'map_out/coco_eval'
+temp_save_path      = '/home/wanboling/disk2/MyMoPKL4/test_out_1'
 
 class MAP_vid(object):
     _defaults = {
         
-        "model_path"        : 'D:/Github/MyMoPKL/logs/ITSDT_80.67_90.35.pth',
-        "classes_path"      : 'D:/Github/MyMoPKL/MoPKL-main/model_data/classes.txt',
+        "model_path"        : '/home/wanboling/disk2/MyMoPKL4/logs/loss_2025_10_15_12_02_17/best_epoch_weights.pth',
+        "classes_path"      : '/home/wanboling/disk2/MyMoPKL4/MoPKL-main/model_data/classes.txt',
         "input_shape"       : [512, 512],
         "phi"               : 's',
         "confidence"        : 0.5,
@@ -63,7 +63,7 @@ class MAP_vid(object):
         
         self.net    = MoPKL(self.num_classes, num_frame=2) 
         device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.net.load_state_dict(torch.load(self.model_path, map_location=device))
+        self.net.load_state_dict(torch.load(self.model_path, map_location=device), strict=False)
         self.net    = self.net.eval()
         print('{} model, and classes loaded.'.format(self.model_path))
         if not onnx:
@@ -94,9 +94,9 @@ class MAP_vid(object):
             if outputs[0] is None: 
                 return results
 
-            top_label   = np.array(outputs[0][:, 6], dtype = 'int32')
-            top_conf    = outputs[0][:, 4] * outputs[0][:, 5]
-            top_boxes   = outputs[0][:, :4]
+            top_label   = np.array(outputs[0][:, 5], dtype = 'int32')  # 类别ID现在在第5个位置
+            top_conf    = outputs[0][:, 4]  # 置信度直接在第4个位置
+            top_boxes   = outputs[0][:, :4]  # 坐标框在前4个位置
 
         for i, c in enumerate(top_label):
             result                      = {}
