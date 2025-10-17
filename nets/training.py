@@ -124,17 +124,19 @@ class YOLOLoss(nn.Module):
 
     def get_losses(self, x_shifts, y_shifts, expanded_strides, labels, outputs):
         #-----------------------------------------------#
-        #   [batch, n_anchors_all, 4]
+        #   [batch, n_anchors_all, 4] - 回归预测
         #-----------------------------------------------#
-        bbox_preds  = outputs[:, :, :4]   #4, 4096, 4
+        bbox_preds  = outputs[:, :, :4]   # 前4个通道：x, y, w, h
         
         #-----------------------------------------------#
-        #   [batch, n_anchors_all, n_cls] - 新的CLIP相似度输出
+        #   [batch, n_anchors_all, 1] - objectness预测
         #-----------------------------------------------#
-        cls_preds   = outputs[:, :, 4:]   # 4+: CLIP相似度 (替代obj+cls)
+        obj_preds   = outputs[:, :, 4:5]  # 第5个通道：objectness
         
-        # 为了兼容性，创建一个虚拟的obj_preds (全为1)
-        obj_preds   = torch.ones_like(cls_preds[:, :, :1])  # [batch, n_anchors_all, 1]  
+        #-----------------------------------------------#
+        #   [batch, n_anchors_all, n_cls] - 分类预测
+        #-----------------------------------------------#
+        cls_preds   = outputs[:, :, 5:]   # 第6个通道开始：分类预测  
         
         total_num_anchors   = outputs.shape[1]
         #-----------------------------------------------#

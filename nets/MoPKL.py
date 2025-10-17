@@ -321,8 +321,7 @@ class MoPKL(nn.Module):
             num_classes=num_classes,
             width=1.0,
             in_channels=[256, 512, 1024],  # 多尺度输入
-            act="silu",
-            embed_dim=512)
+            act="silu")
         self.conv_vl = nn.Sequential(
             BaseConv(128*2,256,3,1),
             BaseConv(256,256,3,1),
@@ -441,7 +440,7 @@ class MoPKL(nn.Module):
 
         motion = self.conv_m(motion.unsqueeze(1)) # 将视觉运动热力图转换成张量
         feat = self.fusion(motion, [updated_feats[3], updated_feats[4], updated_feats[5]])
-        outputs = self.head(feat, text_feat_origin)
+        outputs = self.head(feat)
         
         if self.training:
             return outputs, loss_alignment + loss_relation
@@ -768,50 +767,54 @@ class ContrastiveHead(nn.Module):
 
 class YOLOXHead_CLIP(nn.Module):
     """
-    YOLOX检测头 + CLIP对齐分支
-    每尺度输出通道: [reg(4), simmap(C)] => 4 + C
-    删除obj和传统cls，用CLIP相似度替代
+    传统YOLOX检测头，支持多尺度特征输入
+    每尺度输出通道: [reg(4), obj(1), cls(C)] => 4 + 1 + C
     """
-    def __init__(self, num_classes, in_channels=(256, 512, 1024), embed_dim=512, width=1.0, act="silu"):
+    def __init__(self, num_classes, in_channels=(256, 512, 1024), width=1.0, act="silu"):
         super().__init__()
         Conv = BaseConv
-
+        
         self.num_classes = num_classes
-        self.embed_dim = embed_dim
         self.in_channels = list(in_channels)
         self.nl = len(self.in_channels)
         hidden_c = int(256 * width)
 
-        self.stems      = nn.ModuleList()
+        self.cls_convs  = nn.ModuleList()
         self.reg_convs  = nn.ModuleList()
+        self.cls_preds  = nn.ModuleList()
         self.reg_preds  = nn.ModuleList()
-        self.cv3        = nn.ModuleList()      # 视觉->文本嵌入空间投影
-        self.cv4        = nn.ModuleList()      # 对比相似度头
+        self.obj_preds  = nn.ModuleList()
+        self.stems      = nn.ModuleList()
 
-        for c_in in self.in_channels:
+        for i, c_in in enumerate(self.in_channels):
             # stem
-            self.stems.append(Conv(int(c_in*width), hidden_c, 1, 1, act=act))
-
+            self.stems.append(Conv(int(c_in * width), hidden_c, 1, 1, act=act))
+            
+            # 分类分支
+            self.cls_convs.append(nn.Sequential(*[
+                Conv(hidden_c, hidden_c, 3, 1, act=act), 
+                Conv(hidden_c, hidden_c, 3, 1, act=act), 
+            ]))
+            self.cls_preds.append(
+                nn.Conv2d(hidden_c, num_classes, 1, 1, 0)
+            )
+            
             # 回归分支
-            self.reg_convs.append(nn.Sequential(
-                Conv(hidden_c, hidden_c, 3, 1, act=act),
-                Conv(hidden_c, hidden_c, 3, 1, act=act),
-            ))
-            self.reg_preds.append(nn.Conv2d(hidden_c, 4, 1, 1, 0))
+            self.reg_convs.append(nn.Sequential(*[
+                Conv(hidden_c, hidden_c, 3, 1, act=act), 
+                Conv(hidden_c, hidden_c, 3, 1, act=act)
+            ]))
+            self.reg_preds.append(
+                nn.Conv2d(hidden_c, 4, 1, 1, 0)
+            )
+            self.obj_preds.append(
+                nn.Conv2d(hidden_c, 1, 1, 1, 0)
+            )
 
-            # CLIP投影 + 相似度
-            self.cv3.append(nn.Sequential(
-                Conv(hidden_c, hidden_c, 3, 1, act=act),
-                Conv(hidden_c, hidden_c, 3, 1, act=act),
-                nn.Conv2d(hidden_c, embed_dim, 1, 1, 0),
-            ))
-            self.cv4.append(ContrastiveHead())
-
-    def forward(self, feats, text_embeds):
+    def forward(self, feats):
         """
         feats: list of [B, C_i, H_i, W_i]
-        text_embeds: [B, num_classes, embed_dim]
-        return: list of [B, 4+C, H_i, W_i]
+        return: list of [B, 4+1+C, H_i, W_i]
         """
         assert len(feats) == self.nl
         outputs = []
@@ -819,17 +822,18 @@ class YOLOXHead_CLIP(nn.Module):
         for i, x_in in enumerate(feats):
             x = self.stems[i](x_in)                     # [B, hidden, H, W]
 
+            # 分类分支
+            cls_feat = self.cls_convs[i](x)
+            cls_output = self.cls_preds[i](cls_feat)    # [B, C, H, W]
+
             # 回归分支
-            reg_feat   = self.reg_convs[i](x)
-            reg_out    = self.reg_preds[i](reg_feat)    # [B, 4, H, W]
+            reg_feat = self.reg_convs[i](x)
+            reg_output = self.reg_preds[i](reg_feat)    # [B, 4, H, W]
+            obj_output = self.obj_preds[i](reg_feat)    # [B, 1, H, W]
 
-            # CLIP相似度分支（替代传统分类和objectness）
-            proj   = self.cv3[i](x)                     # [B, E, H, W]
-            simmap = self.cv4[i](proj, text_embeds)     # [B, C, H, W]
-
-            # 拼接: bbox回归 + CLIP相似度
-            out = torch.cat([reg_out, simmap], dim=1)  # [B, 4+C, H, W]
-            outputs.append(out)
+            # 拼接: bbox回归 + objectness + 分类
+            output = torch.cat([reg_output, obj_output, cls_output], 1)  # [B, 4+1+C, H, W]
+            outputs.append(output)
 
         return outputs
 
